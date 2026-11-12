@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>龙池</title>
+<style>
+:root { color-scheme: dark; }
+html, body { margin: 0; height: 100%; background: #000; color: #d8d8d8;
+  font-family: "Noto Sans Mono CJK SC", "Microsoft YaHei", "Geist Mono", Menlo, Consolas, monospace;
+  font-size: 14px; }
+.wrap { min-height: 100%; display: flex; align-items: center; justify-content: center; }
+.box { width: 360px; border: 1px solid #333; background: #121212; padding: 28px 28px 22px; }
+h1 { margin: 0 0 4px; color: #ffcc33; letter-spacing: 4px; font-size: 28px; font-weight: 700; }
+.sub { color: #888; margin-bottom: 22px; font-size: 12px; }
+label { display: block; color: #aaa; font-size: 12px; margin-bottom: 6px; }
+input[type=password] {
+  width: 100%; box-sizing: border-box; height: 36px; padding: 0 10px;
+  background: #0a0a0a; color: #eee; border: 1px solid #3a3a3a; outline: none; font: inherit;
+}
+input[type=password]:focus { border-color: #ffcc33; }
+.row { display: flex; align-items: center; gap: 8px; margin: 12px 0 16px; color: #888; font-size: 12px; }
+button {
+  width: 100%; height: 36px; background: #1a3a6a; color: #fff; border: 1px solid #3a6aaa;
+  cursor: pointer; font: inherit; letter-spacing: 2px;
+}
+button:hover { background: #244a82; color: #ffcc33; }
+button:disabled { opacity: 0.6; cursor: default; }
+.msg { min-height: 20px; margin-top: 12px; font-size: 12px; color: #ff6666; }
+.warn { margin-top: 18px; text-align: center; color: #ffcc33; background: #4a0000;
+  border: 1px solid #aa3333; padding: 6px; font-size: 12px; letter-spacing: 1px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <form class="box" id="f" autocomplete="off">
+    <h1>龙池</h1>
+    <div class="sub">只读看板 · 输入密码后在浏览器里解密</div>
+    <label for="pw">看板密码</label>
+    <input id="pw" name="pw" type="password" autocomplete="current-password" autofocus>
+    <div class="row">
+      <input id="mem" type="checkbox" checked>
+      <label for="mem" style="margin:0">本标签页内保持解锁（关闭标签后失效）</label>
+    </div>
+    <button type="submit" id="go">解锁</button>
+    <div class="msg" id="msg"></div>
+    <div class="warn">模拟盘，不下真实委托</div>
+  </form>
+</div>
+<script>
+(function () {
+  const MAGIC = "LCB1";
+  const STORE = "lc_board_k";
+  const msg = document.getElementById("msg");
+  const go = document.getElementById("go");
+  const pw = document.getElementById("pw");
+  const mem = document.getElementById("mem");
+  let payload = null;
+
+  function setMsg(t, ok) {
+    msg.style.color = ok ? "#8a8" : "#ff6666";
+    msg.textContent = t || "";
+  }
+  function b64(buf) {
+    let s = "";
+    const u = new Uint8Array(buf);
+    for (let i = 0; i < u.length; i++) s += String.fromCharCode(u[i]);
+    return btoa(s);
+  }
+  function fromB64(s) {
+    const bin = atob(s);
+    const u = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+    return u;
+  }
+  function parseBundle(buf) {
+    const u = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+    const magic = new TextDecoder().decode(u.subarray(0, 4));
+    if (magic !== MAGIC) throw new Error("文件格式不对。");
+    const view = new DataView(u.buffer, u.byteOffset, u.byteLength);
+    const iter = view.getUint32(4);
+    const salt = u.subarray(8, 24);
+    const iv = u.subarray(24, 36);
+    const ct = u.subarray(36);
+    if (ct.length < 16) throw new Error("文件不完整。");
+    return { iter, salt, iv, ct };
+  }
+  async function deriveKey(password, salt, iter, extractable) {
+    const enc = new TextEncoder();
+    const material = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveKey"]);
+    return crypto.subtle.deriveKey(
+      { name: "PBKDF2", salt: salt, iterations: iter, hash: "SHA-256" },
+      material,
+      { name: "AES-GCM", length: 256 },
+      !!extractable,
+      ["decrypt"]
+    );
+  }
+  async function importKey(raw) {
+    return crypto.subtle.importKey("raw", raw, { name: "AES-GCM" }, false, ["decrypt"]);
+  }
+  async function decryptWithKey(key, iv, ct) {
+    const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv: iv }, key, ct);
+    const ds = new DecompressionStream("gzip");
+    const stream = new Response(pt).body.pipeThrough(ds);
+    const htmlBuf = await new Response(stream).arrayBuffer();
+    const html = new TextDecoder("utf-8").decode(htmlBuf);
+    document.open();
+    document.write(html);
+    document.close();
+  }
+  async function unlockWithPassword(password, remember) {
+    const p = payload;
+    const key = await deriveKey(password, p.salt, p.iter, remember);
+    await decryptWithKey(key, p.iv, p.ct);
+    if (remember) {
+      const raw = await crypto.subtle.exportKey("raw", key);
+      try { sessionStorage.setItem(STORE, b64(raw)); } catch (e) {}
+    } else {
+      try { sessionStorage.removeItem(STORE); } catch (e) {}
+    }
+  }
+  async function trySession() {
+    let stored;
+    try { stored = sessionStorage.getItem(STORE); } catch (e) { return false; }
+    if (!stored) return false;
+    try {
+      const key = await importKey(fromB64(stored));
+      await decryptWithKey(key, payload.iv, payload.ct);
+      return true;
+    } catch (e) {
+      try { sessionStorage.removeItem(STORE); } catch (e2) {}
+      return false;
+    }
+  }
+  async function load() {
+    setMsg("正在读取…", true);
+    const r = await fetch("payload.bin?ts=" + Date.now(), { cache: "no-store" });
+    if (!r.ok) throw new Error("读取失败（" + r.status + "）。");
+    payload = parseBundle(await r.arrayBuffer());
+    setMsg("", true);
+    if (await trySession()) return;
+  }
+  document.getElementById("f").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    if (!payload) { setMsg("还没读取到文件，请稍后再试。"); return; }
+    const password = pw.value;
+    if (!password) { setMsg("请输入密码。"); return; }
+    go.disabled = true;
+    setMsg("正在解密…", true);
+    try {
+      await unlockWithPassword(password, mem.checked);
+    } catch (err) {
+      setMsg("密码不对，或文件已损坏。");
+      go.disabled = false;
+      pw.focus();
+      pw.select();
+    }
+  });
+  load().catch((err) => setMsg(err && err.message ? err.message : "读取失败。"));
+})();
+</script>
+</body>
+</html>
